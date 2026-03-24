@@ -5,11 +5,6 @@ import ApplicationServices
 // WindowConstrainer
 // Uses the macOS Accessibility API to monitor all windows and prevent them
 // from extending into the dead-zone strip at the bottom of the screen.
-//
-// When a window's bottom edge extends into the dead zone, we either:
-//   1. Exit full-screen first (if the window is in native full-screen)
-//   2. Shrink its height (if the window originated above the dead zone)
-//   3. Move it up (if the window is positioned entirely in the dead zone)
 // ---------------------------------------------------------------------------
 
 class WindowConstrainer {
@@ -17,6 +12,7 @@ class WindowConstrainer {
 
     private var constrainTimer: Timer?
     private var workspaceObservers: [NSObjectProtocol] = []
+    private var mouseMonitor: Any?
 
     /// The inset height in points (from the bottom of the screen).
     var deadZoneHeight: CGFloat = 232.0
@@ -25,7 +21,6 @@ class WindowConstrainer {
     private(set) var isActive = false
 
     /// Track windows we've already exited from full-screen to avoid loops.
-    /// Key = window hash description, Value = timestamp.
     private var recentlyExitedFullScreen: [String: Date] = [:]
 
     // -----------------------------------------------------------------------
@@ -46,12 +41,11 @@ class WindowConstrainer {
         // Constrain all existing windows immediately
         constrainAllWindows()
 
-        // Poll every 0.5s – catches new windows, resized windows, moved windows
-        constrainTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
+        // Poll frequently – catches any window that sneaks past event-based monitoring
+        constrainTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
             self?.constrainAllWindows()
         }
 
-        // Also constrain on app launch / activate / space change for faster response
         let ws = NSWorkspace.shared
         let nc = ws.notificationCenter
 
@@ -66,17 +60,29 @@ class WindowConstrainer {
         let activateObs = nc.addObserver(forName: NSWorkspace.didActivateApplicationNotification,
                                           object: nil, queue: .main) { [weak self] note in
             if let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication {
-                self?.constrainWindowsOf(pid: app.processIdentifier)
+                // Constrain after a tiny delay (window may still be animating)
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                    self?.constrainWindowsOf(pid: app.processIdentifier)
+                }
             }
         }
-        // React to Space changes (full-screen creates a new Space)
         let spaceObs = nc.addObserver(forName: NSWorkspace.activeSpaceDidChangeNotification,
                                        object: nil, queue: .main) { [weak self] _ in
+            // Space change = might be entering/exiting full-screen
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
                 self?.constrainAllWindows()
             }
         }
         workspaceObservers = [launchObs, activateObs, spaceObs]
+
+        // Monitor global mouse-up events — catches zoom/maximize button clicks
+        // and manual window drag-resizes.
+        mouseMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseUp]) { [weak self] _ in
+            // Small delay to let the window finish its resize animation
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                self?.constrainAllWindows()
+            }
+        }
 
         isActive = true
         print("[WindowConstrainer] Started — dead zone: \(deadZone) pt")
@@ -85,6 +91,10 @@ class WindowConstrainer {
     func stop() {
         constrainTimer?.invalidate()
         constrainTimer = nil
+        if let m = mouseMonitor {
+            NSEvent.removeMonitor(m)
+            mouseMonitor = nil
+        }
         for obs in workspaceObservers {
             NSWorkspace.shared.notificationCenter.removeObserver(obs)
         }
@@ -104,11 +114,10 @@ class WindowConstrainer {
     // -----------------------------------------------------------------------
     // MARK: – Core logic
 
-    /// Iterate every visible, standard window on the main screen and constrain it.
     private func constrainAllWindows() {
         guard AXIsProcessTrusted() else { return }
 
-        // Clean up old entries from recentlyExitedFullScreen (older than 5s)
+        // Clean up debounce entries older than 5s
         let cutoff = Date().addingTimeInterval(-5)
         recentlyExitedFullScreen = recentlyExitedFullScreen.filter { $0.value > cutoff }
 
@@ -119,7 +128,6 @@ class WindowConstrainer {
         }
     }
 
-    /// Constrain all windows belonging to a single app.
     private func constrainWindowsOf(pid: pid_t) {
         guard AXIsProcessTrusted() else { return }
         guard let screen = NSScreen.main else { return }
@@ -130,8 +138,6 @@ class WindowConstrainer {
         guard result == .success, let windows = windowsValue as? [AXUIElement] else { return }
 
         let screenFrame = screen.frame
-        // AX uses flipped coordinates (origin = top-left of primary screen).
-        // deadZoneTop in AX coords = screen height minus dead zone height
         let deadZoneTop = screenFrame.height - deadZoneHeight
 
         for window in windows {
@@ -139,22 +145,17 @@ class WindowConstrainer {
         }
     }
 
-    /// Check one window and constrain it if needed.
     private func constrainSingleWindow(_ window: AXUIElement,
                                         deadZoneTop: CGFloat,
                                         screenFrame: CGRect) {
-
-        // --- Check if window is in native full-screen ---
         let windowKey = "\(window)"
+
+        // --- Handle native full-screen ---
         if isFullScreen(window) {
-            // Only exit full-screen if we haven't recently done so (prevent loops)
             if recentlyExitedFullScreen[windowKey] == nil {
                 print("[WindowConstrainer] Exiting full-screen for window")
                 exitFullScreen(window)
                 recentlyExitedFullScreen[windowKey] = Date()
-
-                // After exiting full-screen, the window needs time to animate out.
-                // We'll catch it on the next timer tick and resize it.
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
                     self?.zoomWindowToUsableArea(window, deadZoneTop: deadZoneTop, screenFrame: screenFrame)
                 }
@@ -184,31 +185,31 @@ class WindowConstrainer {
         guard windowBottom > deadZoneTop else { return }
 
         // --- Constrain ---
+        // First: if the window looks "zoomed" (spans close to the full screen height),
+        // resize it to fill just the usable area.
+        let isMaximized = (size.height >= screenFrame.height - 60)
+        if isMaximized {
+            zoomWindowToUsableArea(window, deadZoneTop: deadZoneTop, screenFrame: screenFrame)
+            return
+        }
+
+        // Otherwise: just shrink or move the window out of the dead zone.
         if pos.y < deadZoneTop {
-            // Window starts above dead zone but extends into it → shrink height
             let newHeight = deadZoneTop - pos.y
             guard newHeight >= 100 else { return }
-            var newSize = CGSize(width: size.width, height: newHeight)
-            if let val = AXValueCreate(.cgSize, &newSize) {
-                AXUIElementSetAttributeValue(window, kAXSizeAttribute as CFString, val)
-            }
+            setWindowSize(window, size: CGSize(width: size.width, height: newHeight))
         } else {
             // Window is entirely in the dead zone → move it up
             let moveUp = windowBottom - deadZoneTop
-            var newPos = CGPoint(x: pos.x, y: pos.y - moveUp)
-            if newPos.y < 0 { newPos.y = 0 }
-            if let val = AXValueCreate(.cgPoint, &newPos) {
-                AXUIElementSetAttributeValue(window, kAXPositionAttribute as CFString, val)
-            }
+            var newY = pos.y - moveUp
+            if newY < 0 { newY = 0 }
+            setWindowPosition(window, position: CGPoint(x: pos.x, y: newY))
             // Also shrink if still too tall
-            let adjustedBottom = newPos.y + size.height
+            let adjustedBottom = newY + size.height
             if adjustedBottom > deadZoneTop {
-                let newHeight = deadZoneTop - newPos.y
+                let newHeight = deadZoneTop - newY
                 guard newHeight >= 100 else { return }
-                var newSize = CGSize(width: size.width, height: newHeight)
-                if let val = AXValueCreate(.cgSize, &newSize) {
-                    AXUIElementSetAttributeValue(window, kAXSizeAttribute as CFString, val)
-                }
+                setWindowSize(window, size: CGSize(width: size.width, height: newHeight))
             }
         }
     }
@@ -216,7 +217,6 @@ class WindowConstrainer {
     // -----------------------------------------------------------------------
     // MARK: – Full-screen helpers
 
-    /// Check if window is in native macOS full-screen mode.
     private func isFullScreen(_ window: AXUIElement) -> Bool {
         var value: CFTypeRef?
         let result = AXUIElementCopyAttributeValue(window, "AXFullScreen" as CFString, &value)
@@ -226,38 +226,51 @@ class WindowConstrainer {
         return false
     }
 
-    /// Exit native macOS full-screen mode.
     private func exitFullScreen(_ window: AXUIElement) {
         AXUIElementSetAttributeValue(window, "AXFullScreen" as CFString, kCFBooleanFalse)
     }
 
-    /// After exiting full-screen, zoom the window to fill the usable area
-    /// (full screen minus menu bar and dead zone).
+    /// Position and size the window to fill the usable screen area
+    /// (between menu bar and dead zone).
     private func zoomWindowToUsableArea(_ window: AXUIElement,
                                          deadZoneTop: CGFloat,
                                          screenFrame: CGRect) {
-        // In AX flipped coords:
-        //   top of usable area = menu bar height (typically ~25–38 pt)
-        //   bottom of usable area = deadZoneTop
-        // We use NSScreen.visibleFrame to get the menu bar offset.
         guard let screen = NSScreen.main else { return }
         let visibleFrame = screen.visibleFrame
 
-        // Convert visibleFrame to AX flipped coords
+        // Convert to AX flipped coords
         let menuBarHeight = screenFrame.height - (visibleFrame.minY + visibleFrame.height)
         let topY = max(menuBarHeight, 0)
         let usableHeight = deadZoneTop - topY
 
         guard usableHeight > 100 else { return }
 
-        var newPos = CGPoint(x: screenFrame.minX, y: topY)
-        var newSize = CGSize(width: screenFrame.width, height: usableHeight)
+        // Set position FIRST, then size — some apps compute layout from position
+        setWindowPosition(window, position: CGPoint(x: screenFrame.minX, y: topY))
+        setWindowSize(window, size: CGSize(width: screenFrame.width, height: usableHeight))
 
-        if let posVal = AXValueCreate(.cgPoint, &newPos) {
-            AXUIElementSetAttributeValue(window, kAXPositionAttribute as CFString, posVal)
+        // Some apps fight back (e.g. Chrome). Re-apply after a short delay.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
+            guard self?.isActive == true else { return }
+            self?.setWindowPosition(window, position: CGPoint(x: screenFrame.minX, y: topY))
+            self?.setWindowSize(window, size: CGSize(width: screenFrame.width, height: usableHeight))
         }
-        if let sizeVal = AXValueCreate(.cgSize, &newSize) {
-            AXUIElementSetAttributeValue(window, kAXSizeAttribute as CFString, sizeVal)
+    }
+
+    // -----------------------------------------------------------------------
+    // MARK: – AX convenience methods
+
+    private func setWindowPosition(_ window: AXUIElement, position: CGPoint) {
+        var pos = position
+        if let val = AXValueCreate(.cgPoint, &pos) {
+            AXUIElementSetAttributeValue(window, kAXPositionAttribute as CFString, val)
+        }
+    }
+
+    private func setWindowSize(_ window: AXUIElement, size: CGSize) {
+        var sz = size
+        if let val = AXValueCreate(.cgSize, &sz) {
+            AXUIElementSetAttributeValue(window, kAXSizeAttribute as CFString, val)
         }
     }
 }
