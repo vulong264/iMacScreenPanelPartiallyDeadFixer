@@ -193,7 +193,7 @@ class DisplayEngine {
         win.isOpaque           = true
         win.hasShadow          = false
         win.ignoresMouseEvents = true
-        win.collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle, .fullScreenNone]
+        win.collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle, .fullScreenAuxiliary]
         win.isReleasedWhenClosed = false
         return win
     }
