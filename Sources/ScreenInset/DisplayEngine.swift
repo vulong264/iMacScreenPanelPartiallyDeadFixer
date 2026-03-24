@@ -27,7 +27,11 @@ class DisplayEngine {
     static let shared = DisplayEngine()
 
     /// Points to cover at the bottom of the screen (the dead LCD panel strip).
-    var targetInsetPoints: CGFloat = 232.0
+    var targetInsetPoints: CGFloat = 232.0 {
+        didSet {
+            WindowConstrainer.shared.updateDeadZone(targetInsetPoints)
+        }
+    }
 
     private(set) var isInsetEnabled = false
 
@@ -110,6 +114,10 @@ class DisplayEngine {
             self?.reapplyIfNeeded()
         }
 
+        // Start the Accessibility-based window constrainer.
+        // This actively prevents app windows from extending into the dead zone.
+        WindowConstrainer.shared.start(deadZone: targetInsetPoints)
+
         isInsetEnabled = true
         return true
     }
@@ -120,6 +128,9 @@ class DisplayEngine {
     private func disableInset() {
         reapplyTimer?.invalidate()
         reapplyTimer = nil
+
+        // Stop constraining windows.
+        WindowConstrainer.shared.stop()
 
         // Restore whatever the Dock had before we overrode it.
         setDockRect(savedBottomRect, orientation: kDockOrientationBottom)

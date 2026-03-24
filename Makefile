@@ -19,6 +19,7 @@ run: build
 install: build
 	mkdir -p $(INSTALL_DIR)
 	cp $(BUILD_DIR)/$(APP_NAME) $(INSTALL_DIR)/$(APP_NAME)
+	codesign -f -s - $(INSTALL_DIR)/$(APP_NAME)
 	mkdir -p $(PLIST_DIR)
 	@echo '<?xml version="1.0" encoding="UTF-8"?>' > $(PLIST_DIR)/com.user.screeninset.plist
 	@echo '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' >> $(PLIST_DIR)/com.user.screeninset.plist
