@@ -1,4 +1,4 @@
 .build/
 *.o
 *.tbd
-ScreenInset
+/ScreenInset
